@@ -36,7 +36,9 @@ Submits a new puzzle to be solved. If the puzzle is too difficult, it will retur
 **Request Body (JSON):**
 ```json
 {
-  "puzzle": "SIGNATURE.BASE64_PAYLOAD"
+  "puzzle": "SIGNATURE.BASE64_PAYLOAD",
+  "activate_payload": { ... }, // Optional: If you want the solver to fetch the puzzle itself
+  "proxy": "http://user:pass@ip:port" // Optional: Used to route the activate_payload request
 }
 ```
 
