@@ -17,7 +17,7 @@ const THRESHOLD_MIN: u32 = 3000;
 // How long (secs) before we kill a task nobody is polling
 const ABANDON_SECS: u64 = 3;
 
-// --- Task State Management ---
+// Task State Management
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -42,7 +42,7 @@ struct Task {
 
 type TaskDb = Arc<RwLock<HashMap<String, Task>>>;
 
-// --- API Models ---
+// API Models
 
 #[derive(Deserialize)]
 struct CreateTaskReq {
@@ -81,7 +81,7 @@ struct GetResultRes {
     error_description: Option<String>,
 }
 
-// --- The CPU Burner Logic ---
+// The CPU Burner Logic
 
 fn decode_b64(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
     STANDARD.decode(input)
@@ -204,7 +204,7 @@ fn set_error(db: &TaskDb, task_id: &str, error_msg: &str) {
     }
 }
 
-// --- Endpoints ---
+// Endpoints
 
 async fn create_task(
     axum::extract::State(db): axum::extract::State<TaskDb>,
@@ -354,7 +354,7 @@ async fn get_task_result(
     }
 }
 
-// --- Sweeper: kills tasks that nobody polls within ABANDON_SECS ---
+// Sweeper: kills tasks that nobody polls within ABANDON_SECS
 async fn run_sweeper(db: TaskDb) {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
