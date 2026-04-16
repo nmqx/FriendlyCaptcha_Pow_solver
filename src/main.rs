@@ -1,21 +1,31 @@
-use axum::{routing::post, Json, Router};
+use axum::{
+    routing::post,
+    Json, Router,
+};
 use base64::{engine::general_purpose::STANDARD, engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use blake2b_simd::Params;
-use rand::{Rng, RngCore};
+use rand::RngCore;
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::net::TcpListener;
 
-// Task State Management
+const THRESHOLD_MIN: u32 = 3000;
+// How long (secs) before we kill a task nobody is polling
+const ABANDON_SECS: u64 = 3;
 
-#[derive(Clone)]
+// --- Task State Management ---
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum TaskStatus {
     Processing,
     Ready,
     Error,
+    Cancelled,
 }
 
 #[derive(Clone)]
@@ -23,15 +33,35 @@ struct Task {
     status: TaskStatus,
     solution: Option<String>,
     error: Option<String>,
+    // Set to true the moment getTaskResult is called for this task
+    polled: Arc<AtomicBool>,
+    // Used by the sweeper to know when to give up
+    cancel: Arc<AtomicBool>,
+    created_at: Instant,
 }
 
 type TaskDb = Arc<RwLock<HashMap<String, Task>>>;
 
-// API Request Models
+// --- API Models ---
 
 #[derive(Deserialize)]
 struct CreateTaskReq {
-    puzzle: String,
+    #[serde(default)]
+    puzzle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activate_payload: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proxy: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateTaskRes {
+    error_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -40,28 +70,33 @@ struct GetResultReq {
     task_id: String,
 }
 
-// Helper Functions
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetResultRes {
+    error_id: i32,
+    status: TaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    solution: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_description: Option<String>,
+}
+
+// --- The CPU Burner Logic ---
 
 fn decode_b64(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    STANDARD.decode(input).or_else(|_| STANDARD_NO_PAD.decode(input))
+    STANDARD.decode(input)
+        .or_else(|_| STANDARD_NO_PAD.decode(input))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(input))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(input))
 }
 
-fn set_error(db: &TaskDb, task_id: &str, error_msg: &str) {
-    let mut db_write = db.write().unwrap();
-    if let Some(task) = db_write.get_mut(task_id) {
-        task.status = TaskStatus::Error;
-        task.error = Some(error_msg.to_string());
-    }
-}
-
-// The High-Performance CPU Burner
-
-fn solve_puzzle(task_id: String, db: TaskDb, puzzle_payload: String) {
+fn solve_puzzle(task_id: String, db: TaskDb, puzzle_payload: String, cancel: Arc<AtomicBool>) {
     let start_time = Instant::now();
 
     let parts: Vec<&str> = puzzle_payload.split('.').collect();
     if parts.len() != 2 {
-        set_error(&db, &task_id, "Invalid puzzle format");
+        let msg = format!("Invalid puzzle format, got {} parts.", parts.len());
+        set_error(&db, &task_id, &msg);
         return;
     }
 
@@ -85,75 +120,74 @@ fn solve_puzzle(task_id: String, db: TaskDb, puzzle_payload: String) {
     let threshold_byte = puzzle_data[15] as f64;
     let threshold = 2f64.powf((255.999 - threshold_byte) / 8.0) as u32;
 
-    // 1. CALCULATE EXACT BROWSER TIME (WASM SPEED)
-    let expected_hashes_per_puzzle = 4_294_967_296.0 / (threshold as f64);
-    let total_expected_hashes = (n_puzzles as f64) * expected_hashes_per_puzzle;
-    
-    // WASM engine averages 18 MH/s. This drastically drops the simulated time.
-    let browser_hash_rate = 18_000_000.0; 
-    let base_time_s = total_expected_hashes / browser_hash_rate;
+    if threshold < THRESHOLD_MIN {
+        let msg = format!("Refusing: threshold {} < {} (IP likely flagged)", threshold, THRESHOLD_MIN);
+        set_error(&db, &task_id, &msg);
+        return;
+    }
 
-    // Add +/- 15% natural jitter
-    use rand::Rng;
-    let jitter_factor = rand::thread_rng().gen_range(0.85..1.15);
-    let simulated_time_s = (base_time_s * jitter_factor).round() as u16;
-    let fake_time_taken = simulated_time_s.max(1); // At least 1 second
+    println!("[*] Task {}: {} sub-puzzles, threshold={}", task_id, n_puzzles, threshold);
 
-    println!("[*] Task {}: Expected hashes: {}, Simulated WASM Time: {}s", task_id, total_expected_hashes.round(), fake_time_taken);
+    let buf_size = puzzle_data.len() + 8;
+    let nonce_offset = buf_size - 8;
+    let nonce_u32_offset = buf_size - 4;
 
-    // 2. SOLVE AT MAX SIMD CPU SPEED
-    let solutions_vec: Vec<Vec<u8>> = (0..n_puzzles)
+    // RAYON PARALLEL ITERATOR — checks cancel flag every 50k iterations
+    let solutions_vec: Vec<Option<Vec<u8>>> = (0..n_puzzles)
         .into_par_iter()
         .map(|p| {
-            let mut buf = [0u8; 128];
+            let mut buf = vec![0u8; buf_size];
             buf[..puzzle_data.len()].copy_from_slice(&puzzle_data);
-            buf[120] = p as u8;
+            buf[nonce_offset] = p as u8;
 
             let mut nonce: u32 = 0;
             let mut hasher_params = Params::new();
             hasher_params.hash_length(32);
 
             loop {
-                buf[124..128].copy_from_slice(&nonce.to_le_bytes());
+                // Check cancellation every 50k iters to avoid slowing hashing
+                if nonce % 50_000 == 0 && cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+
+                buf[nonce_u32_offset..buf_size].copy_from_slice(&nonce.to_le_bytes());
                 let hash = hasher_params.hash(&buf);
                 let hash_val = u32::from_le_bytes(hash.as_bytes()[0..4].try_into().unwrap());
 
                 if hash_val < threshold {
-                    return buf[120..128].to_vec();
+                    return Some(buf[nonce_offset..buf_size].to_vec());
                 }
                 nonce += 1;
             }
         })
         .collect();
 
-    let actual_time_taken = start_time.elapsed();
+    // If we were cancelled mid-solve, just bail out silently
+    if cancel.load(Ordering::Relaxed) {
+        println!("[!] Task {} was cancelled (nobody polled within {}s). Discarding.", task_id, ABANDON_SECS);
+        let mut db_write = db.write().unwrap();
+        if let Some(task) = db_write.get_mut(&task_id) {
+            task.status = TaskStatus::Cancelled;
+            task.error = Some("Abandoned: no poll received in time".to_string());
+        }
+        return;
+    }
+
+    let time_taken = start_time.elapsed().as_secs() as u16;
 
     let mut flat_solutions = Vec::with_capacity(n_puzzles * 8);
     for sol in solutions_vec {
-        flat_solutions.extend(sol);
+        flat_solutions.extend(sol.unwrap());
     }
 
-    // 3. TELEMETRY PING (WASM + BIG ENDIAN FIX)
-    let mut diag = vec![0u8; 3];
-    diag[0] = 2; // 2 = WASM Solver (Matches our 18 MH/s speed assumption)
-    
-    // CRITICAL: to_be_bytes() formats the time exactly how the JS DataView expects it
-    diag[1..3].copy_from_slice(&fake_time_taken.to_be_bytes());
+    let mut diag = vec![1u8; 3];
+    diag[1..3].copy_from_slice(&time_taken.to_le_bytes());
 
     let sol_b64 = STANDARD.encode(&flat_solutions);
     let diag_b64 = STANDARD.encode(&diag);
-
     let final_solution = format!("{}.{}.{}.{}", signature, b64_puzzle_data, sol_b64, diag_b64);
 
-    // 4. HOLD AND RELEASE
-    let simulated_duration = std::time::Duration::from_secs(fake_time_taken as u64);
-    if simulated_duration > actual_time_taken {
-        let sleep_time = simulated_duration - actual_time_taken;
-        println!("[*] Task {} holding for {:?} to match WASM fake telemetry...", task_id, sleep_time);
-        std::thread::sleep(sleep_time);
-    }
-
-    println!("[+] Task {} ready!", task_id);
+    println!("[+] Task {} solved in {}s!", task_id, time_taken);
 
     let mut db_write = db.write().unwrap();
     if let Some(task) = db_write.get_mut(&task_id) {
@@ -162,45 +196,35 @@ fn solve_puzzle(task_id: String, db: TaskDb, puzzle_payload: String) {
     }
 }
 
-// API Endpoints
+fn set_error(db: &TaskDb, task_id: &str, error_msg: &str) {
+    let mut db_write = db.write().unwrap();
+    if let Some(task) = db_write.get_mut(task_id) {
+        task.status = TaskStatus::Error;
+        task.error = Some(error_msg.to_string());
+    }
+}
+
+// --- Endpoints ---
 
 async fn create_task(
     axum::extract::State(db): axum::extract::State<TaskDb>,
     Json(payload): Json<CreateTaskReq>,
-) -> Json<serde_json::Value> {
-    if payload.puzzle.is_empty() {
-        return Json(serde_json::json!({
-            "errorId": 1,
-            "errorDescription": "Missing puzzle"
-        }));
+) -> Json<CreateTaskRes> {
+    if payload.puzzle.is_none() && payload.activate_payload.is_none() {
+        return Json(CreateTaskRes {
+            error_id: 1,
+            task_id: None,
+            error_description: Some("Missing puzzle or activate_payload".to_string()),
+        });
     }
 
-    // Fast-Fail Difficulty Check
-    let parts: Vec<&str> = payload.puzzle.split('.').collect();
-    if parts.len() == 2 {
-        if let Ok(puzzle_data) = decode_b64(parts[1]) {
-            if puzzle_data.len() >= 16 {
-                let threshold_byte = puzzle_data[15] as f64;
-                let threshold = 2f64.powf((255.999 - threshold_byte) / 8.0) as u32;
-                
-                // If it's going to take longer than ~8 seconds, reject it so OB rotates proxy
-                if threshold < 1000 {
-                    println!("[!] Puzzle rejected upfront. Threshold {} is < 1000.", threshold);
-                    return Json(serde_json::json!({
-                        "errorId": 1,
-                        "status": "too_long"
-                    }));
-                }
-            }
-        }
-    }
-
-    // Generate Task ID
     let mut tid_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut tid_bytes);
     let task_id = hex::encode(tid_bytes);
 
-    // Save initial state
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let polled_flag = Arc::new(AtomicBool::new(false));
+
     {
         let mut db_write = db.write().unwrap();
         db_write.insert(
@@ -209,55 +233,143 @@ async fn create_task(
                 status: TaskStatus::Processing,
                 solution: None,
                 error: None,
+                polled: polled_flag.clone(),
+                cancel: cancel_flag.clone(),
+                created_at: Instant::now(),
             },
         );
     }
 
-    println!("[*] New task created: {}. Starting background SIMD solver...", task_id);
+    println!("[*] New task created: {}", task_id);
 
-    // Spawn blocking task
     let db_clone = db.clone();
     let task_id_clone = task_id.clone();
-    tokio::task::spawn_blocking(move || {
-        solve_puzzle(task_id_clone, db_clone, payload.puzzle);
+    let cancel_clone = cancel_flag.clone();
+
+    tokio::spawn(async move {
+        let puzzle_payload = if let Some(activate_data) = payload.activate_payload {
+            let mut builder = reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36");
+
+            if let Some(proxy_str) = payload.proxy {
+                if let Ok(p) = reqwest::Proxy::all(&proxy_str) {
+                    builder = builder.proxy(p);
+                }
+            }
+
+            let client = match builder.build() {
+                Ok(c) => c,
+                Err(e) => {
+                    set_error(&db_clone, &task_id_clone, &format!("HTTP client build failed: {}", e));
+                    return;
+                }
+            };
+
+            let res = match client.post("https://global.frcapi.com/api/v2/captcha/activate")
+                .header("origin", "https://global.frcapi.com")
+                .header("frc-agent-id", "a_MsItqi4Jw9rn")
+                .header("frc-sdk", "friendly-captcha-sdk@0.1.31")
+                .json(&activate_data)
+                .send()
+                .await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        set_error(&db_clone, &task_id_clone, &format!("Network fetch failed: {}", e));
+                        return;
+                    }
+                };
+
+            if !res.status().is_success() {
+                set_error(&db_clone, &task_id_clone, &format!("Activate HTTP {}", res.status()));
+                return;
+            }
+
+            let body: serde_json::Value = match res.json().await {
+                Ok(b) => b,
+                Err(e) => {
+                    set_error(&db_clone, &task_id_clone, &format!("Parse failed: {}", e));
+                    return;
+                }
+            };
+
+            let ctx_opt = body["data"]["solve_context"].as_str()
+                .or_else(|| body["solve_context"].as_str())
+                .or_else(|| body["puzzle"].as_str());
+
+            match ctx_opt {
+                Some(ctx) => ctx.to_string(),
+                None => {
+                    set_error(&db_clone, &task_id_clone, &format!("No solve_context in response: {}", body));
+                    return;
+                }
+            }
+        } else {
+            payload.puzzle.unwrap()
+        };
+
+        tokio::task::spawn_blocking(move || {
+            solve_puzzle(task_id_clone, db_clone, puzzle_payload, cancel_clone);
+        });
     });
 
-    Json(serde_json::json!({
-        "errorId": 0,
-        "taskId": task_id
-    }))
+    Json(CreateTaskRes {
+        error_id: 0,
+        task_id: Some(task_id),
+        error_description: None,
+    })
 }
 
 async fn get_task_result(
     axum::extract::State(db): axum::extract::State<TaskDb>,
     Json(payload): Json<GetResultReq>,
-) -> Json<serde_json::Value> {
+) -> Json<GetResultRes> {
     let db_read = db.read().unwrap();
-    
+
     match db_read.get(&payload.task_id) {
-        Some(task) => match task.status {
-            TaskStatus::Ready => Json(serde_json::json!({
-                "errorId": 0,
-                "status": "ready",
-                "solution": {
-                    "frc_solution": task.solution
+        Some(task) => {
+            // Mark as polled so the sweeper doesn't kill it
+            task.polled.store(true, Ordering::Relaxed);
+
+            let mut solution_map = None;
+            if let Some(sol) = &task.solution {
+                let mut map = HashMap::new();
+                map.insert("frc_solution".to_string(), sol.clone());
+                solution_map = Some(map);
+            }
+
+            Json(GetResultRes {
+                error_id: if task.error.is_some() { 1 } else { 0 },
+                status: task.status.clone(),
+                solution: solution_map,
+                error_description: task.error.clone(),
+            })
+        }
+        None => Json(GetResultRes {
+            error_id: 1,
+            status: TaskStatus::Error,
+            solution: None,
+            error_description: Some("Task not found".to_string()),
+        }),
+    }
+}
+
+// --- Sweeper: kills tasks that nobody polls within ABANDON_SECS ---
+async fn run_sweeper(db: TaskDb) {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let db_read = db.read().unwrap();
+        for (tid, task) in db_read.iter() {
+            if let TaskStatus::Processing = task.status {
+                let not_polled = !task.polled.load(Ordering::Relaxed);
+                let timed_out = task.created_at.elapsed().as_secs() >= ABANDON_SECS;
+                if not_polled && timed_out {
+                    println!("[!] Sweeper: cancelling task {} (no poll in {}s)", tid, ABANDON_SECS);
+                    task.cancel.store(true, Ordering::Relaxed);
                 }
-            })),
-            TaskStatus::Processing => Json(serde_json::json!({
-                "errorId": 0,
-                "status": "processing"
-            })),
-            TaskStatus::Error => Json(serde_json::json!({
-                "errorId": 1,
-                "status": "error",
-                "errorDescription": task.error
-            })),
-        },
-        None => Json(serde_json::json!({
-            "errorId": 1,
-            "status": "error",
-            "errorDescription": "Task not found"
-        })),
+            }
+        }
     }
 }
 
@@ -265,12 +377,15 @@ async fn get_task_result(
 async fn main() {
     let db: TaskDb = Arc::new(RwLock::new(HashMap::new()));
 
+    // Start background sweeper
+    tokio::spawn(run_sweeper(db.clone()));
+
     let app = Router::new()
         .route("/createTask", post(create_task))
         .route("/getTaskResult", post(get_task_result))
         .with_state(db);
 
     let listener = TcpListener::bind("127.0.0.1:8989").await.unwrap();
-    println!("frc solver running on http://127.0.0.1:8989");
+    println!(" Solver running on http://127.0.0.1:8989");
     axum::serve(listener, app).await.unwrap();
 }
